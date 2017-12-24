@@ -12,60 +12,12 @@ import (
     "errors"
 )
 
-type Resource interface{}
-type Resources map[string]Resource
-
-type ReadCloser interface {
-    io.Reader
-    Close() error
-}
-
-type GetReaderFn func(string, Resource) (ReadCloser, error)
-type Readers map[string]GetReaderFn
-
-
-func debug_reader(source string, unused Resource) (ReadCloser, error) {
-    return &Src{0, "Goreading Gofrom Go file: Go" + source}, nil
-}
-
-func file_reader(source string, unsued Resource) (ReadCloser, error) {
-    f, err := os.Open(source)
-    return f, err
-}
-
-// don't forget to timeout http requests
-func url_reader(source string, r Resource) (ReadCloser, error) {
-    http_client, ok := r.(*http.Client)
-    if !ok {
-        return nil, errors.New("wrong type: expected http.Client type")
-    }
-
-    res, err := http_client.Get(source)
-
-    if err != nil {
-        return nil, err
-    }
-    body := res.Body
-    return body, nil
-}
-
-func get_url_resource() Resource {
-    // set time out for request
-    request_timeout := 5 * time.Second
-    // leave default redirect policy: 10 hops
-    client := &http.Client{
-                    Timeout: request_timeout,
-    }
-    return client
-}
-
-// --- devel stuff for testing ---
-type Src struct {
+type DebugSource struct {
     cur_pos int
     text string
 }
 
-func (s *Src) Read(p []byte) (n int, err error) {
+func (s *DebugSource) Read(p []byte) (n int, err error) {
     // make it slow
     time.Sleep(1*time.Second)
 
@@ -90,10 +42,66 @@ func (s *Src) Read(p []byte) (n int, err error) {
     }
 }
 
-func (s *Src) Close() error {
+func (s *DebugSource) Close() error {
     return nil
 }
-// -------------------
+
+
+type ReaderFactory interface {
+    Init()
+    GetReader(string) (io.ReadCloser, error)
+}
+
+type DebugReaderFactory struct {}
+
+func (d *DebugReaderFactory) Init() {
+}
+
+func (d *DebugReaderFactory) GetReader(foo string) (io.ReadCloser, error) {
+    return &DebugSource{0, "Text to find Go instance"}, nil
+}
+
+
+type FileReaderFactory struct {
+}
+
+func (frf *FileReaderFactory) Init() {
+}
+
+func (frf *FileReaderFactory) GetReader(name string) (io.ReadCloser, error) {
+    if len(name) == 0 {
+        return nil, errors.New("FileReaderFactory: file name is empty")
+    }
+
+    file, err := os.Open(name)
+    return file, err
+}
+
+type URLReaderFactory struct {
+   client *http.Client
+}
+
+func (urf *URLReaderFactory) Init() {
+    request_timeout := 5 * time.Second
+    // leave default redirect policy: 10 hops
+    urf.client = &http.Client{
+                         Timeout: request_timeout,
+               }
+}
+
+func (urf *URLReaderFactory) GetReader(url string) (io.ReadCloser, error) {
+    if len(url) == 0 {
+        return nil, errors.New("URLReaderFactory: Open: url is empty")
+    }
+
+    res, err := urf.client.Get(url)
+
+    if err != nil {
+        return nil, err
+    }
+
+    return res.Body, nil
+}
 
 func exit_with_error(error_text string) {
     fmt.Fprintf(os.Stderr, "%s\n", error_text)
@@ -102,16 +110,9 @@ func exit_with_error(error_text string) {
     os.Exit(1)
 }
 
-func list_types(c Readers) string {
-    // don't use super fast bytes.Buffer here
-    // for simplicity and convenience.
-    // we expect only a few items to iterate over
-    s := []string{}
-    for k, _ := range c {
-        s = append(s, k)
-    }
-
-    return strings.Join(s, ", ")
+func list_types() string {
+        // keep types in the map of type "constructors"
+	return "file, url, debug"
 }
 
 func input_reader(ch_input chan<- string, ch_done chan<- bool,
@@ -122,101 +123,94 @@ func input_reader(ch_input chan<- string, ch_done chan<- bool,
         source, err := std_reader.ReadString('\n')
         if err != nil {
             if err != io.EOF {
-                fmt.Fprintf(os.Stderr, "[Error] on stdin reading: %s\n", err.Error())
+                fmt.Fprintf(os.Stderr, "[Error] on stdin reading: %s\n",
+                            err.Error())
             }
             break
         }
+        source = strings.TrimSpace(source)
         ch_input <- source
     }
     ch_done <- true
 }
 
-func word_counter(word string, source string, resource Resource,
-                  get_reader GetReaderFn, ch_count chan<- uint) {
+func count_words(word string, src string, reader_factory ReaderFactory,
+                 ch_count chan<- uint) {
     var count uint
-
-    src := strings.TrimSpace(source)
+    defer func() {
+              ch_count <- count
+          }()
 
     if len(src) == 0 {
-        ch_count <- 0
         return
     }
 
-    rc, err := get_reader(src, resource)
+    defer func() {
+              fmt.Printf("Count for %s: %d\n", src, count)
+          }()
 
-    switch {
-        case err != nil:
-            fmt.Fprintf(os.Stderr, "[Error][%s] on getting reader: %s\n", src, err.Error())
-        case rc == nil:
-            // paraniod check (assertion) -- if someone added a new type unproperly
-            // this would give a hint what is wrong
-            fmt.Fprintf(os.Stderr, "[Error][%s] no reader\n", src)
-        default:
-            buf_reader := bufio.NewReader(rc)
-
-            var s string
-            var err error
-
-            for {
-                s, err = buf_reader.ReadString(' ')
-
-                if err != nil {
-                    if err == io.EOF {
-                        count += uint(strings.Count(s, word))
-                    } else {
-                        fmt.Fprintf(os.Stderr, "[Error][%s] on string reading: %s\n", src, err.Error())
-                    }
-                    break
-                }
-                count += uint(strings.Count(s, word))
-            }
-
-            err = rc.Close()
-            if err != nil {
-                fmt.Fprintf(os.Stderr, "[Error][%s] on reader closing: %s\n", src, err.Error())
-            }
+    reader, err := reader_factory.GetReader(src)
+    if err != nil {
+        fmt.Fprintf(os.Stderr, "[Error][%s] on getting reader: %s\n",
+                    src, err.Error())
+        return
     }
 
-    fmt.Fprintf(os.Stdout, "Count for %s: %d\n", src, count)
+    // Close reader
+    defer func() {
+              err := reader.Close()
+              if err != nil {
+                  fmt.Fprintf(os.Stderr, "[Error][%s] on closing: %s\n",
+                              src, err.Error())
+              }
+          }()
 
-    ch_count <- count
+    buf_reader := bufio.NewReader(reader)
+
+    var s string
+
+    for {
+        s, err = buf_reader.ReadString(' ')
+
+        if err != nil {
+            if err == io.EOF {
+                count += uint(strings.Count(s, word))
+            } else {
+                fmt.Fprintf(os.Stderr, "[Error][%s] on string reading: %s\n",
+                            src, err.Error())
+            }
+            break
+        }
+        count += uint(strings.Count(s, word))
+    }
 }
 
 func main() {
     word := "Go"
     in_flight_limit := 5  // "k" in the assignment text
 
-    readers := make(Readers);
-    readers["file"] = file_reader
-    readers["url"] = url_reader
-    readers["debug"] = debug_reader
-
-    // for every reader there should be a corresponiding
-    // resource 
-    resources := make(Resources);
-    resources["file"] = nil
-    resources["url"] = get_url_resource()
-    resources["debug"] = nil
-
     user_type := flag.String("type", "", "type of input. supported types: " +
-                     list_types(readers))
+                             list_types())
     flag.Parse()
 
     if len(*user_type) == 0 {
         exit_with_error("type should be specified")
     }
 
-    reader, ok := readers[*user_type]
-    if !ok {
-        error_text := "type '" + *user_type + "' isn't supported"
-        exit_with_error(error_text)
+    var reader_factory ReaderFactory
+
+    switch *user_type {
+    case "file":
+        reader_factory = &FileReaderFactory{}
+    case "url":
+        reader_factory = &URLReaderFactory{}
+    case "debug":
+        reader_factory = &DebugReaderFactory{}
+    default:
+        exit_with_error("type '" + *user_type + "' isn't supported")
     }
 
-    resource, ok := resources[*user_type]
-    if !ok {
-        error_text := "there is no resourse assgned for: '" + *user_type
-        exit_with_error(error_text)
-    }
+    reader_factory.Init()
 
     ch_input_reader_done := make(chan bool)
     ch_input := make(chan string, 1)
@@ -225,7 +219,7 @@ func main() {
     go input_reader(ch_input, ch_input_reader_done, ch_input_go_on)
     ch_input_go_on<-true
 
-    ch_word_count := make(chan uint)
+    ch_word_counter := make(chan uint)
 
     var total uint
 
@@ -239,7 +233,7 @@ func main() {
             case input := <-ch_input:
                 if (req_in_flight != in_flight_limit) {
                     ch_input_go_on <- true
-                    go word_counter(word, input, resource, reader, ch_word_count)
+                    go count_words(word, input, reader_factory, ch_word_counter)
                     req_in_flight += 1
                 } else {
                     tmp_input = input
@@ -250,7 +244,7 @@ func main() {
                 }
             case <-ch_input_reader_done:
                 has_input = false
-            case word_count := <-ch_word_count:
+            case word_count := <-ch_word_counter:
                 total += word_count
                 req_in_flight -= 1
                 // a little bit ugly but we need only one string here
